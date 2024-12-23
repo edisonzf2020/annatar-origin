@@ -9,6 +9,9 @@ from annatar import config, instrumentation
 from annatar.logging import init as init_logging
 from annatar.torrent import Category
 
+from dotenv import load_dotenv
+load_dotenv()
+
 instrumentation.init()
 init_logging()
 

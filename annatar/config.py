@@ -9,6 +9,9 @@ from pydantic import BaseModel, ValidationError, root_validator
 from annatar.api.filters import Filter, by_category
 from annatar.api.filters import by_id as filter_by_id
 
+from dotenv import load_dotenv
+load_dotenv()
+
 log = structlog.get_logger()
 DEFAULT_INDEXERS = (
     "yts,eztv,kickasstorrents-ws,therarbg,torrentgalaxy,bitsearch,limetorrents,badasstorrents"
