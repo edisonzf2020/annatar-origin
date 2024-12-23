@@ -150,6 +150,14 @@ async def make_request(
             ) as response:
                 if response.status == 200:
                     raw: dict[str, Any] = await response.json()
+                    # log.info(
+                    #     "jackett search response",
+                    #     url=url,
+                    #     params={k: v for k, v in params.items() if k != "apikey"},
+                    #     results_count=len(raw.get("Results", [])),
+                    #     indexers=raw.get("Indexers", []),
+                    #     results=raw.get("Results", [])
+                    # )
                     res = model.model_validate(raw)
                     await db.set_model(cache_key, res, JACKETT_CACHE_MINUTES)
                     return res

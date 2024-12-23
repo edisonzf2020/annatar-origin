@@ -1,60 +1,67 @@
-from typing import Optional
+from typing import Optional, List
 
 from pydantic import BaseModel
-
-
-class InstantFileSet(BaseModel):
-    file_ids: list[int]
-
-
-class InstantFile(BaseModel):
-    id: int
-    filename: str
-    filesize: int
-
-
-class StreamableFile(BaseModel):
-    id: int
-    link: str
-    size: int
 
 
 class TorrentFile(BaseModel):
     id: int
     path: str
-    bytes: int = 0
+    bytes: int
     selected: int = 0
 
 
 class TorrentInfo(BaseModel):
-    added: str
-    bytes: int
+    id: str
     filename: str
     hash: str
+    bytes: int
     host: str
-    id: str
-    links: list[str]
-    progress: float
     split: int
+    progress: int
     status: str
-
+    added: str
+    files: List[TorrentFile]
+    links: List[str]
     ended: Optional[str] = None
-    files: Optional[list[TorrentFile]] = None
-    original_bytes: Optional[int] = None
-    original_filename: Optional[str] = None
-    seeders: Optional[int] = None
-    speed: Optional[int] = None
+
+
+class DownloadLink(BaseModel):
+    id: str
+    mimeType: Optional[str] = None  # Make mimeType optional with default None
+    download: str
+    filename: str
+    filesize: int
+
+
+class DeviceCode(BaseModel):
+    device_code: str
+    user_code: str
+    verification_url: str
+    expires_in: int
+    interval: int
+
+
+class TokenInfo(BaseModel):
+    access_token: str
+    expires_in: int
+    refresh_token: str
+    token_type: str
+
+
+class InstantFile(BaseModel):
+    id: int
+    filename: str
+    size: int
 
 
 class UnrestrictedLink(BaseModel):
     id: str
-    info_hash: str
     filename: str
-    mimeType: str  # Mime Type of the file, guessed by the file extension
-    filesize: int  # Filesize in bytes, 0 if unknown
-    link: str  # Original link
-    host: str  # Host main domain
-    chunks: int  # Max Chunks allowed
-    crc: int  # Disable / enable CRC check
-    download: str  # Generated link
-    streamable: int  # Is the file streamable on website
+    mimeType: str
+    filesize: int
+    link: str
+    host: str
+    chunks: int
+    crc: int
+    download: str
+    streamable: int
