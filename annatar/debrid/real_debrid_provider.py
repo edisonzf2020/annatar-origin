@@ -32,10 +32,12 @@ class RealDebridProvider(DebridService):
 
     def __init__(self, api_key: str, source_ip: Optional[str] = None):
         """Initialize the provider with API key and optional source IP."""
+        super().__init__(api_key=api_key, source_ip=source_ip)  # 调用父类的初始化方法
         self.api_key = api_key
         self.source_ip = source_ip
         self._session = None
         self._headers = None
+        self.headers = {"Authorization": f"Bearer {api_key}"}  # 直接设置认证头
 
     async def __aenter__(self):
         """Async context manager enter."""
@@ -48,6 +50,7 @@ class RealDebridProvider(DebridService):
         if self._session:
             await self._session.close()
             self._session = None
+        await super().__aexit__(exc_type, exc_val, exc_tb)  # 调用父类的 __aexit__ 方法
 
     def __str__(self) -> str:
         return "RealDebridProvider"
@@ -81,63 +84,50 @@ class RealDebridProvider(DebridService):
             season: Season number for TV shows
             episode: Episode number for TV shows
         """
-        count = 0
-        for magnet in torrents:
-            if stop.is_set() or (max_results and count >= max_results):
-                break
+        try:
+            log.info(
+                "getting RealDebrid stream links",
+                torrents_count=len(torrents),
+                season=season,
+                episode=episode
+            )
 
-            try:
-                # Extract info hash from magnet link if needed
-                info_hash = magnet.split("btih:")[-1].split("&")[0].lower() if "magnet:" in magnet else magnet
+            # 通过get_user_info 得到用户信息，log用户信息
+            user_info = await self.get_user_info()
+            log.info("got RealDebrid user info", user_info=user_info)
+
+            # 通过 get_stream_for_torrent 循环获得流媒体链接
+            for torrent in torrents:
+                if stop.is_set():
+                    break
+                # 如果是磁力链接，提取info_hash
+                # info_hash = torrent.split("btih:")[-1].split("&")[0].lower() if "magnet:" in torrent else torrent
+                # log.info("processing torrent", info_hash=info_hash)
                 
-                # Get torrent info
-                torrent_info = await self.get_available_torrent(info_hash)
-                if not torrent_info:
-                    continue
-
-                # Check if torrent is already downloaded
-                if torrent_info["status"] == "downloaded":
-                    for file in torrent_info["files"]:
-                        if not file["selected"]:
-                            continue
-                            
-                        name = file["path"].split("/")[-1]
-                        size = file["bytes"]
-                        
-                        # Get download link
-                        try:
-                            response = await self._create_download_link(file["download"])
-                            if response and response.get("download"):
-                                yield StreamLink(
-                                    name=name,
-                                    size=size,
-                                    url=response["download"]
-                                )
-                                count += 1
-                                if max_results and count >= max_results:
-                                    break
-                        except ProviderException:
-                            continue
-
-            except (KeyError, IndexError, ProviderException):
-                continue
+                stream_link = await self.get_stream_for_torrent(torrent, 0)
+                if stream_link:
+                    yield stream_link
+        finally:
+            # 确保在生成器完成时关闭session
+            if self._session:
+                await self._session.close()
+                self._session = None
 
     async def get_stream_for_torrent(
         self,
         info_hash: str,
         file_id: int,
-        debrid_token: str,
     ) -> Optional[StreamLink]:
         """Get a stream link for a specific torrent file.
         
         Args:
             info_hash: Torrent info hash
             file_id: File ID within the torrent
-            debrid_token: RealDebrid API token
         """
         try:
             # Get torrent info
             torrent_info = await self.get_available_torrent(info_hash)
+            log.info("checked a torrent info response from RealDebrid", info_hash=info_hash, torrent_info=torrent_info)
             if not torrent_info:
                 return None
 
@@ -156,6 +146,7 @@ class RealDebridProvider(DebridService):
             if not response or not response.get("download"):
                 return None
 
+            log.info("created a cached torrent download link", response=response)
             return StreamLink(
                 name=target_file["path"].split("/")[-1],
                 size=target_file["bytes"],
@@ -359,8 +350,11 @@ class RealDebridProvider(DebridService):
 
     async def get_available_torrent(self, info_hash) -> Optional[dict[str, Any]]:
         available_torrents = await self.get_user_torrent_list()
+        info_hash = info_hash.lower()  # 将输入的info_hash转换为小写
         for torrent in available_torrents:
-            if torrent["hash"] == info_hash:
+            torrent_hash = torrent["hash"].lower()  # 将RealDebrid返回的hash转换为小写
+            # log.info("checking torrent from RealDebrid", torrent_info_hash=torrent_hash, info_hash=info_hash)
+            if torrent_hash == info_hash:
                 return torrent
         return None
 
