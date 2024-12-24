@@ -72,22 +72,98 @@ class RealDebridProvider(DebridService):
         season: int = 0,
         episode: int = 0,
     ) -> AsyncGenerator[StreamLink, None]:
-        """Get stream links for torrents."""
+        """Get stream links for a list of torrents.
+        
+        Args:
+            torrents: List of magnet links or info hashes
+            stop: Event to stop processing
+            max_results: Maximum number of results to return
+            season: Season number for TV shows
+            episode: Episode number for TV shows
+        """
         count = 0
-        for torrent in torrents:
-            if stop.is_set():
-                break
-            if max_results and count >= max_results:
+        for magnet in torrents:
+            if stop.is_set() or (max_results and count >= max_results):
                 break
 
-            # 这里应该实现实际的流链接获取逻辑
-            # 目前只返回一个示例链接
-            yield StreamLink(
-                name=f"Sample Stream {torrent}",
-                size=1024 * 1024,  # 1MB
-                url=f"https://example.com/stream/{torrent}"
+            try:
+                # Extract info hash from magnet link if needed
+                info_hash = magnet.split("btih:")[-1].split("&")[0].lower() if "magnet:" in magnet else magnet
+                
+                # Get torrent info
+                torrent_info = await self.get_available_torrent(info_hash)
+                if not torrent_info:
+                    continue
+
+                # Check if torrent is already downloaded
+                if torrent_info["status"] == "downloaded":
+                    for file in torrent_info["files"]:
+                        if not file["selected"]:
+                            continue
+                            
+                        name = file["path"].split("/")[-1]
+                        size = file["bytes"]
+                        
+                        # Get download link
+                        try:
+                            response = await self._create_download_link(file["download"])
+                            if response and response.get("download"):
+                                yield StreamLink(
+                                    name=name,
+                                    size=size,
+                                    url=response["download"]
+                                )
+                                count += 1
+                                if max_results and count >= max_results:
+                                    break
+                        except ProviderException:
+                            continue
+
+            except (KeyError, IndexError, ProviderException):
+                continue
+
+    async def get_stream_for_torrent(
+        self,
+        info_hash: str,
+        file_id: int,
+        debrid_token: str,
+    ) -> Optional[StreamLink]:
+        """Get a stream link for a specific torrent file.
+        
+        Args:
+            info_hash: Torrent info hash
+            file_id: File ID within the torrent
+            debrid_token: RealDebrid API token
+        """
+        try:
+            # Get torrent info
+            torrent_info = await self.get_available_torrent(info_hash)
+            if not torrent_info:
+                return None
+
+            # Find the specific file
+            target_file = None
+            for file in torrent_info["files"]:
+                if file["id"] == str(file_id):
+                    target_file = file
+                    break
+
+            if not target_file:
+                return None
+
+            # Get download link
+            response = await self._create_download_link(target_file["download"])
+            if not response or not response.get("download"):
+                return None
+
+            return StreamLink(
+                name=target_file["path"].split("/")[-1],
+                size=target_file["bytes"],
+                url=response["download"]
             )
-            count += 1
+
+        except (KeyError, IndexError, ProviderException):
+            return None
 
     async def _handle_service_specific_errors(self, error_data: dict, status_code: int):
         """Handle service specific errors."""
