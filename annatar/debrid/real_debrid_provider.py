@@ -1,9 +1,10 @@
 import asyncio
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Any
 import structlog
 
 import aiohttp
 
+from annatar import instrumentation, magnet
 from annatar.debrid.debrid_service import DebridService
 from annatar.debrid.models import StreamLink
 from annatar.debrid.rd_models import (
@@ -42,7 +43,7 @@ class RealDebridProvider(DebridService):
         url: str,
         data: Optional[dict] = None,
         params: Optional[dict] = None,
-    ) -> dict:
+    ) -> Any:
         if method in ["POST", "PUT"] and self.source_ip:
             data = data or {}
             data["ip"] = self.source_ip
@@ -193,11 +194,11 @@ class RealDebridProvider(DebridService):
 
     async def add_magnet(self, info_hash: str) -> Optional[str]:
         """Add a magnet link and return torrent ID"""
-        magnet = f"magnet:?xt=urn:btih:{info_hash}"
+        # magnet = f"magnet:?xt=urn:btih:{info_hash}"
         response = await self.make_request(
             "POST", 
             "/torrents/addMagnet",
-            data={"magnet": magnet}
+            data={"magnet": magnet.make_magnet_link(info_hash=info_hash)}
         )
         if response:
             log.debug("added magnet", info_hash=info_hash, torrent_id=response.get("id"))
@@ -216,7 +217,7 @@ class RealDebridProvider(DebridService):
                     "got torrent info",
                     torrent_id=torrent_id,
                     status=info.status,
-                    files_count=len(info.files)
+                    files_count=len(info.files or [])  # 使用 or [] 来处理 None 的情况
                 )
                 return info
             except Exception as e:
