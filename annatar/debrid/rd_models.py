@@ -2,6 +2,19 @@ from typing import Optional, List
 
 from pydantic import BaseModel
 
+class InstantFileSet(BaseModel):
+    file_ids: list[int]
+
+
+class InstantFile(BaseModel):
+    id: int
+    filename: str
+    filesize: int
+
+class StreamableFile(BaseModel):
+    id: int
+    link: str
+    size: int
 
 class TorrentFile(BaseModel):
     id: int
@@ -11,19 +24,23 @@ class TorrentFile(BaseModel):
 
 
 class TorrentInfo(BaseModel):
-    id: str
+    added: str
+    bytes: int
     filename: str
     hash: str
-    bytes: int
     host: str
+    id: str
+    links: list[str]
+    progress: float
     split: int
-    progress: float  # Changed from int to float to match API response
     status: str
-    added: str
-    files: List[TorrentFile]
-    links: List[str]
-    ended: Optional[str] = None
 
+    ended: Optional[str] = None
+    files: Optional[list[TorrentFile]] = None
+    original_bytes: Optional[int] = None
+    original_filename: Optional[str] = None
+    seeders: Optional[int] = None
+    speed: Optional[int] = None
 
 class DownloadLink(BaseModel):
     id: str
@@ -46,13 +63,6 @@ class TokenInfo(BaseModel):
     expires_in: int
     refresh_token: str
     token_type: str
-
-
-class InstantFile(BaseModel):
-    id: int
-    filename: str
-    size: int
-
 
 class UnrestrictedLink(BaseModel):
     id: str

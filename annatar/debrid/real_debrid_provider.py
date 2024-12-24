@@ -1,11 +1,9 @@
 import asyncio
 from typing import AsyncGenerator, Optional
 import structlog
-from datetime import datetime
 
 import aiohttp
 
-from annatar import instrumentation
 from annatar.debrid.debrid_service import DebridService
 from annatar.debrid.models import StreamLink
 from annatar.debrid.rd_models import (
@@ -56,47 +54,75 @@ class RealDebridProvider(DebridService):
             data=data,
             params=params
         )
-        start_time = datetime.now()
-        status_code: str = "2xx"
-        error = False
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.request(
-                    method,
-                    f"{self.BASE_URL}{url}",
-                    headers=self.headers,
-                    data=data,
-                    params=params,
-                ) as response:
-                    status_code = f"{response.status//100}xx"
-                    if response.status in [401, 403]:
-                        log.error(
-                            "RD authentication failed",
-                            status=response.status,
-                            reason=response.reason,
-                            url=url,
-                        )
-                        return None
-                if response.status not in range(200, 300):
-                    error = True
+        async with aiohttp.ClientSession() as session:
+            async with session.request(
+                method,
+                f"{self.BASE_URL}{url}",
+                headers=self.headers,
+                data=data,
+                params=params,
+            ) as response:
+                if response.status in [401, 403]:
                     log.error(
-                        "Error making request",
+                        "RD authentication failed",
                         status=response.status,
                         reason=response.reason,
                         url=url,
-                        body=await response.text(),
                     )
                     return None
-                return await response.json()
-        finally:
-            instrumentation.HTTP_CLIENT_REQUEST_DURATION.labels(
-                client="real_debrid",
-                method=method,
-                url=url,
-                error=error,
-                status_code=status_code,
-            ).observe((datetime.now() - start_time).total_seconds())
+                try:
+                    response.raise_for_status()
+                    return await response.json()
+                except Exception as e:
+                    log.error(
+                        "RD request failed",
+                        exc_info=e,
+                        status=response.status,
+                        url=url,
+                        data=data,
+                    )
+                    return None
+
+    async def wait_for_status(self, torrent_id: str, target_status: str) -> Optional[TorrentInfo]:
+        """Wait for torrent to reach a specific status"""
+        retry_interval = 5  # 使用 5 秒间隔，避免过多请求
+        acceptable_statuses = {
+            "downloaded": ["downloaded"],
+            "waiting_files_selection": ["waiting_files_selection"],
+        }
+        
+        while True:
+            torrent_info = await self.get_torrent_info(torrent_id)
+            if not torrent_info:
+                log.warning("failed to get torrent info", torrent_id=torrent_id)
+                return None
+            
+            # 如果目标是 downloaded，那么 queued 和 downloading 都是可接受的中间状态
+            if target_status == "downloaded" and torrent_info.status in ["queued", "downloading"]:
+                pass  # 继续等待
+            elif torrent_info.status in acceptable_statuses.get(target_status, []):
+                log.debug(
+                    "torrent reached target status",
+                    torrent_id=torrent_id,
+                    status=target_status
+                )
+                return torrent_info
+            elif torrent_info.status == "error":
+                log.error(
+                    "torrent failed with error status",
+                    torrent_id=torrent_id
+                )
+                return None
+                
+            log.debug(
+                "waiting for status",
+                torrent_id=torrent_id,
+                current_status=torrent_info.status,
+                target_status=target_status,
+                progress=torrent_info.progress
+            )
+            await asyncio.sleep(retry_interval)
 
     async def get_stream_links(
         self,
@@ -106,6 +132,7 @@ class RealDebridProvider(DebridService):
         season: int = 0,
         episode: int = 0,
     ) -> AsyncGenerator[StreamLink, None]:
+        """Get stream links for torrents"""
         log.info(
             "getting stream links",
             torrents_count=len(torrents),
@@ -113,7 +140,7 @@ class RealDebridProvider(DebridService):
             episode=episode
         )
 
-        for info_hash in torrents:
+        for info_hash in torrents[:max_results]:
             if stop.is_set():
                 log.info("stopping stream link generation - received stop signal")
                 break
@@ -126,8 +153,8 @@ class RealDebridProvider(DebridService):
                 log.warning("failed to add magnet", info_hash=info_hash)
                 continue
 
-            # Get torrent info
-            torrent_info = await self.get_torrent_info(torrent_id)
+            # Get torrent info and wait for file selection
+            torrent_info = await self.wait_for_status(torrent_id, "waiting_files_selection")
             if not torrent_info:
                 log.warning("failed to get torrent info", torrent_id=torrent_id)
                 continue
@@ -141,10 +168,10 @@ class RealDebridProvider(DebridService):
             log.debug("starting download", torrent_id=torrent_id, file_id=file_id)
             await self.start_torrent_download(torrent_id, file_id)
             
-            # Wait for download and get link
-            torrent_info = await self.wait_for_download(torrent_id)
+            # Wait for download
+            torrent_info = await self.wait_for_status(torrent_id, "downloaded")
             if not torrent_info:
-                log.warning("download failed or timed out", torrent_id=torrent_id)
+                log.warning("download failed", torrent_id=torrent_id)
                 continue
 
             download_link = await self.get_download_link(torrent_info.links[0])
@@ -227,63 +254,23 @@ class RealDebridProvider(DebridService):
         )
         return file_id
 
-    async def start_torrent_download(
-        self,
-        torrent_id: str,
-        file_id: int
-    ) -> bool:
-        """Start downloading selected files"""
-        response = await self.make_request(
-            "POST",
-            f"/torrents/selectFiles/{torrent_id}",
-            data={"files": str(file_id)}
-        )
-        success = response is not None
-        if success:
-            log.debug("started download", torrent_id=torrent_id, file_id=file_id)
-        else:
-            log.warning("failed to start download", torrent_id=torrent_id, file_id=file_id)
-        return success
-
-    async def wait_for_download(
-        self,
-        torrent_id: str,
-        max_retries: int = 30,
-        retry_interval: int = 5
-    ) -> Optional[TorrentInfo]:
-        """Wait for torrent to finish downloading"""
-        for attempt in range(max_retries):
-            torrent_info = await self.get_torrent_info(torrent_id)
-            if not torrent_info:
-                log.warning(
-                    "failed to get torrent info while waiting",
-                    torrent_id=torrent_id,
-                    attempt=attempt
-                )
-                return None
-            
-            if torrent_info.status == "downloaded":
-                log.debug(
-                    "download completed",
-                    torrent_id=torrent_id,
-                    attempts=attempt
-                )
-                return torrent_info
-                
-            log.debug(
-                "waiting for download",
-                torrent_id=torrent_id,
-                status=torrent_info.status,
-                attempt=attempt
+    async def start_torrent_download(self, torrent_id: str, file_id: int) -> bool:
+        """Start downloading a torrent"""
+        try:
+            await self.make_request(
+                "POST",
+                f"{self.BASE_URL}/torrents/selectFiles/{torrent_id}",
+                data={"files": str(file_id)}
             )
-            await asyncio.sleep(retry_interval)
-
-        log.warning(
-            "download wait timeout",
-            torrent_id=torrent_id,
-            max_retries=max_retries
-        )
-        return None
+            return True
+        except Exception as e:
+            log.warning(
+                "failed to start download",
+                torrent_id=torrent_id,
+                file_id=file_id,
+                error=str(e)
+            )
+            return False
 
     async def get_download_link(self, link: str) -> Optional[DownloadLink]:
         """Get download link for a file"""
