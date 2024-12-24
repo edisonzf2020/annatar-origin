@@ -1,0 +1,4 @@
+beanie==1.28.0
+pytz==2024.2
+parsett==1.5.2
+pydantic-settings==2.7.0

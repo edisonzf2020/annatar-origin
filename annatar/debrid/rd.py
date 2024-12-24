@@ -1,311 +1,251 @@
 import asyncio
-from datetime import timedelta
-from hashlib import sha256
-from typing import AsyncGenerator, Optional
-from urllib.parse import quote_plus
+from typing import Optional
 
-import structlog
+from fastapi import BackgroundTasks
 
-from annatar import human
-from annatar.database import db
-from annatar.debrid import real_debrid_api as api
-from annatar.debrid.models import StreamLink
-from annatar.debrid.rd_models import (
-    InstantFile,
-    InstantFileSet,
-    TorrentFile,
-    TorrentInfo,
-    UnrestrictedLink,
+from annatar.debrid.models import TorrentStreams
+# from annatar.utils.schemas import UserData
+from annatar.debrid.exceptions import ProviderException
+from annatar.debrid.parser import (
+    select_file_index_from_torrent,
+    update_torrent_streams_metadata,
 )
-
-ROOT_URL = "https://api.real-debrid.com/rest/1.0"
-
-
-log = structlog.get_logger(__name__)
+from annatar.debrid.real_debrid_provider import RealDebridProvider
 
 
-async def find_streamable_file_id(
-    files: list[TorrentFile],
-    season: int = 0,
-    episode: int = 0,
-) -> TorrentFile | None:
-    if len(files) == 0:
-        log.debug("No files, returning 0")
-        return None
+async def create_download_link(
+    rd_client: RealDebridProvider,
+    magnet_link: str,
+    torrent_info: dict,
+    filename: Optional[str],
+    file_index: Optional[int],
+    episode: Optional[int],
+    season: Optional[int],
+    stream: TorrentStreams,
+    background_tasks,
+    max_retries: int,
+    retry_interval: int,
+) -> str:
+    selected_file_index = await select_file_index_from_torrent(
+        torrent_info,
+        filename,
+        episode,
+        "files",
+        "path",
+        "bytes",
+        True,
+    )
 
-    video_files: list[TorrentFile] = [
-        file for file in files if human.is_video(file.path, file.bytes)
-    ]
-    if len(video_files) < 1:
-        log.debug("release has no video files")
-        return None
-
-    sorted_files: list[TorrentFile] = sorted(video_files, key=lambda f: f.bytes, reverse=True)
-    if not season or not episode:
-        log.debug("returning biggest file", file=sorted_files[0])
-        return (
-            sorted_files[0] if human.is_video(sorted_files[0].path, sorted_files[0].bytes) else None
+    if filename is None or file_index is None:
+        background_tasks.add_task(
+            update_torrent_streams_metadata,
+            torrent_stream=stream,
+            torrent_info=torrent_info,
+            file_index=selected_file_index,
+            season=season,
+            file_key="files",
+            name_key="path",
+            size_key="bytes",
+            remove_leading_slash=True,
+            is_index_trustable=True,
         )
 
-    for file in sorted_files:
-        path = file.path.lower()
-        if human.match_season_episode(season=season, episode=episode, file=path):
-            if not human.is_video(path, file.bytes):
-                continue
-            log.info(
-                "found matched file for season/episode",
-                file=file,
-                season=season,
-                episode=episode,
+    relevant_file = torrent_info["files"][selected_file_index]
+    selected_files = [file for file in torrent_info["files"] if file["selected"] == 1]
+
+    if relevant_file not in selected_files or len(selected_files) != len(
+        torrent_info["links"]
+    ):
+        await rd_client.delete_torrent(torrent_info["id"])
+        torrent_id = (await rd_client.add_magnet_link(magnet_link)).get("id")
+        torrent_info = await rd_client.wait_for_status(
+            torrent_id, "waiting_files_selection", max_retries, retry_interval
+        )
+        await rd_client.start_torrent_download(
+            torrent_info["id"],
+            file_ids=torrent_info["files"][selected_file_index]["id"],
+        )
+        torrent_info = await rd_client.wait_for_status(
+            torrent_id, "downloaded", max_retries, retry_interval
+        )
+        link_index = 0
+    else:
+        link_index = selected_files.index(relevant_file)
+
+    response = await rd_client.create_download_link(torrent_info["links"][link_index])
+
+    if not response.get("mimeType").startswith("video"):
+        await rd_client.delete_torrent(torrent_info["id"])
+        raise ProviderException(
+            f"Requested file is not a video file, deleting torrent and retrying. {response['mimeType']}",
+            "torrent_not_downloaded.mp4",
+        )
+
+    return response.get("download")
+
+
+async def get_video_url_from_realdebrid(
+    info_hash: str,
+    magnet_link: str,
+    api_key: str,
+    user_ip: str,
+    filename: Optional[str],
+    file_index: Optional[int],
+    stream: TorrentStreams,
+    background_tasks: BackgroundTasks,
+    max_retries=5,
+    retry_interval=5,
+    episode: Optional[int] = None,
+    season: Optional[int] = None,
+    **kwargs,
+) -> str:
+    async with RealDebridProvider(
+        api_key=api_key, source_ip=user_ip
+    ) as rd_client:
+        torrent_info = await rd_client.get_available_torrent(info_hash)
+
+        if not torrent_info:
+            torrent_info = await add_new_torrent(
+                rd_client, magnet_link, info_hash, stream
             )
-            return file
-    log.info(
-        "No file found for season/episode",
-        season=season,
-        episode=episode,
-    )
-    return None
+
+        torrent_id = torrent_info["id"]
+        status = torrent_info["status"]
+
+        if status in ["magnet_error", "error", "virus", "dead"]:
+            await rd_client.delete_torrent(torrent_id)
+            raise ProviderException(
+                f"Torrent cannot be downloaded due to status: {status}",
+                "transfer_error.mp4",
+            )
+
+        if status not in ["queued", "downloading", "downloaded"]:
+            torrent_info = await rd_client.wait_for_status(
+                torrent_id,
+                "waiting_files_selection",
+                max_retries,
+                retry_interval,
+                torrent_info,
+            )
+            try:
+                await rd_client.start_torrent_download(
+                    torrent_info["id"],
+                    file_ids="all",
+                )
+            except ProviderException as error:
+                await rd_client.delete_torrent(torrent_id)
+                raise ProviderException(
+                    f"Failed to start torrent download, {error}", "transfer_error.mp4"
+                )
+
+        torrent_info = await rd_client.wait_for_status(
+            torrent_id, "downloaded", max_retries, retry_interval
+        )
+
+        return await create_download_link(
+            rd_client,
+            magnet_link,
+            torrent_info,
+            filename,
+            file_index,
+            episode,
+            season,
+            stream,
+            background_tasks,
+            max_retries,
+            retry_interval,
+        )
 
 
-async def get_torrent_link(
-    torrent_id: str,
-    file_id: int,
-    info_hash: str,
-    debrid_token: str,
-) -> str | None:
-    for attempt in range(5):
-        torrent: TorrentInfo | None = await api.get_torrent_info(torrent_id, debrid_token)
-        if not torrent:
-            log.error("torrent info wasn't found")
-            await asyncio.sleep(attempt * 0.5)
-            continue
+async def add_new_torrent(rd_client, magnet_link, info_hash, stream):
+    response = await rd_client.get_active_torrents()
+    if response["limit"] == response["nb"]:
+        raise ProviderException(
+            "Torrent limit reached. Please try again later.", "torrent_limit.mp4"
+        )
+    if info_hash in response["list"]:
+        raise ProviderException(
+            "Torrent is already being downloading", "torrent_not_downloaded.mp4"
+        )
 
-        if torrent.status != "downloaded":
-            log.error("torrent is not downloaded yet", status=torrent.status)
-            await asyncio.sleep(attempt * 0.5)
-            continue
-
-        if not torrent.files:
-            log.error("torrent has no files")
-            return None
-
-        selected_files: list[int] = [f.id for f in torrent.files if f.selected]
-        for i, fid in enumerate(selected_files):
-            if fid == file_id:
-                return torrent.links[i]
-
-    log.error(
-        "couldn't get instant torrent content",
-        torrent_id=torrent_id,
-        file_id=file_id,
-        info_hash=info_hash,
-    )
-    return None
-
-
-async def _get_stream_for_torrent(
-    info_hash: str,
-    file_id: int,
-    debrid_token: str,
-    source_ip: str,
-) -> Optional[UnrestrictedLink]:
-    file_set: InstantFileSet | None = await db.get_model(
-        key=f"rd:instant_file_set:torrent:{info_hash.upper()}:{file_id}",
-        model=InstantFileSet,
-    )
-
-    if not file_set:
-        log.error("cached torrent not found", info_hash=info_hash)
-        return None
-
-    torrent_id: Optional[str] = None
-
-    if existing_torrents := await api.list_torrents(debrid_token=debrid_token, limit=100):
-        log.debug("existing torrents found", count=len(existing_torrents))
-        for t in existing_torrents:
-            if t.hash.casefold() == info_hash.casefold():
-                log.debug("torrent already exists", info_hash=info_hash)
-                torrent_id = t.id
-                break
+    if stream.torrent_file:
+        torrent_id = (await rd_client.add_torrent_file(stream.torrent_file)).get("id")
+    else:
+        torrent_id = (await rd_client.add_magnet_link(magnet_link)).get("id")
 
     if not torrent_id:
-        torrent_id = await api.add_magnet(
-            info_hash=info_hash,
-            debrid_token=debrid_token,
-            source_ip=source_ip,
-        )
-        log.info("magnet added to RD", torrent_id=torrent_id)
-
-        if not torrent_id:
-            log.info("no torrent id found")
-            return None
-
-        log.info("selecting instant file set in torrent", torrent_id=torrent_id, file_id=file_id)
-        selected: bool = await api.select_torrent_files(
-            torrent_id=torrent_id,
-            debrid_token=debrid_token,
-            file_ids=file_set.file_ids,
-            source_ip=source_ip,
-        )
-        if selected:
-            log.info("Selected torrent file set", torrent_id=torrent_id, file_id=file_id)
-        else:
-            log.error("Failed to select torrent file set", torrent_id=torrent_id, file_id=file_id)
-
-    torrent_link: str | None = await get_torrent_link(
-        torrent_id=torrent_id,
-        file_id=file_id,
-        info_hash=info_hash,
-        debrid_token=debrid_token,
-    )
-    if not torrent_link:
-        log.info("no torrent link found")
-        return None
-
-    log.info("RD Cached links found", link=torrent_link)
-
-    unrestricted_link: Optional[UnrestrictedLink] = await api.unrestrict_link(
-        info_hash=info_hash,
-        link=torrent_link,
-        debrid_token=debrid_token,
-        source_ip=source_ip,
-    )
-    if not unrestricted_link:
-        log.info("no unrestrict link found")
-        return None
-
-    log.info("Unrestricted link found", link=unrestricted_link.download)
-    return unrestricted_link
-
-
-async def get_stream_for_torrent(
-    info_hash: str,
-    file_id: int,
-    debrid_token: str,
-    source_ip: str,
-) -> Optional[StreamLink]:
-    """
-    Get the stream link for a torrent and file.
-    """
-    key_hash: str = sha256(debrid_token.encode()).hexdigest()
-    cache_key: str = f"rd:torrent:{info_hash}:{key_hash}:{file_id}"
-    cached_stream: Optional[StreamLink] = await db.get_model(cache_key, model=StreamLink)
-    if cached_stream:
-        log.info("Cached stream found", stream=cached_stream)
-        return cached_stream
-
-    unrestricted_link: Optional[UnrestrictedLink] = await _get_stream_for_torrent(
-        info_hash=info_hash,
-        file_id=file_id,
-        debrid_token=debrid_token,
-        source_ip=source_ip,
-    )
-    if not unrestricted_link:
-        log.info("No unrestricted link found")
-        return None
-
-    sl: StreamLink = StreamLink(
-        size=unrestricted_link.filesize,
-        name=unrestricted_link.filename,
-        url=unrestricted_link.download,
-    )
-    await db.set_model(cache_key, sl, ttl=timedelta(hours=4))
-    return sl
-
-
-async def get_stream_link(
-    info_hash: str,
-    debrid_token: str,
-    season: int = 0,
-    episode: int = 0,
-) -> StreamLink | None:
-    info_hash = info_hash.upper()
-    async for cached_files in api.get_instant_availability(
-        info_hash,
-        debrid_token,
-    ):
-        if not cached_files:
-            continue
-
-        torrent_files: list[TorrentFile] = [
-            TorrentFile(
-                id=f.id,
-                path=f.filename,
-                bytes=f.filesize,
-            )
-            for f in cached_files
-        ]
-        torrent_file: TorrentFile | None = await find_streamable_file_id(
-            files=torrent_files,
-            season=season,
-            episode=episode,
+        raise ProviderException(
+            "Failed to add magnet link to Real-Debrid", "transfer_error.mp4"
         )
 
-        if not torrent_file:
-            log.debug("set does not contain a suitable file")
-            continue
+    return await rd_client.get_torrent_info(torrent_id)
 
-        file: InstantFile | None = next((f for f in cached_files if f.id == torrent_file.id), None)
-        if not file:
-            log.error(
-                "cached file set does not contain the desired file_id. This should not be possible",
-                torrent=info_hash,
-                file_id=torrent_file.id,
-            )
-            return None
 
-        log.debug("found matching instantAvailable set")
-        # urlencode the filename
-        filename = quote_plus(torrent_file.path.split("/")[-1])
-        # this route has to match the route provided to provide the 302
-        url: str = f"/rd/{debrid_token}/{info_hash}/{torrent_file.id}/{filename}"
+async def update_rd_cache_status(
+    streams: list[TorrentStreams], api_key: str, user_ip: str, **kwargs
+):
+    """Updates the cache status of streams based on user's downloaded torrents in RealDebrid."""
 
-        await db.set_model(
-            key=f"rd:instant_file_set:torrent:{info_hash}:{torrent_file.id}",
-            model=InstantFileSet(file_ids=[f.id for f in cached_files]),
-            ttl=timedelta(hours=8),
+    try:
+        downloaded_hashes = set(
+            await fetch_downloaded_info_hashes_from_rd(api_key, user_ip, **kwargs)
         )
-
-        return StreamLink(
-            size=file.filesize,
-            name=file.filename,
-            url=url,
-        )
-    return None
-
-
-async def get_stream_links(
-    torrents: list[str],
-    debrid_token: str,
-    stop: asyncio.Event,
-    max_results: int,
-    season: int = 0,
-    episode: int = 0,
-) -> AsyncGenerator[StreamLink, None]:
-    """
-    Generates a list of RD links for each torrent link.
-    """
-    concurrency = max_results * 3
-    grouped = [torrents[i : i + concurrency] for i in range(0, len(torrents), concurrency)]
-
-    for group in grouped:
-        if stop.is_set():
+        if not downloaded_hashes:
             return
-        tasks = [
-            asyncio.create_task(
-                get_stream_link(
-                    info_hash=info_hash,
-                    season=season,
-                    episode=episode,
-                    debrid_token=debrid_token,
-                )
-            )
-            for info_hash in group
-        ]
+        for stream in streams:
+            stream.cached = stream.id in downloaded_hashes
 
-        for task in asyncio.as_completed(tasks):
-            link = await task
-            if link:
-                yield link
-            if stop.is_set():
-                return
+    except ProviderException:
+        pass
+
+
+async def fetch_downloaded_info_hashes_from_rd(
+    api_key: str, user_ip: str, **kwargs
+) -> list[str]:
+    """Fetches the info_hashes of all torrents downloaded in the RealDebrid account."""
+    try:
+        async with RealDebridProvider(
+            api_key=api_key, source_ip=user_ip
+        ) as rd_client:
+            available_torrents = await rd_client.get_user_torrent_list()
+            return [
+                torrent["hash"]
+                for torrent in available_torrents
+                if torrent["status"] == "downloaded"
+            ]
+
+    except ProviderException:
+        return []
+
+
+async def delete_all_watchlist_rd(api_key: str, user_ip: str, **kwargs):
+    """Deletes all torrents from the RealDebrid watchlist."""
+    async with RealDebridProvider(
+        api_key=api_key, source_ip=user_ip
+    ) as rd_client:
+        torrents = await rd_client.get_user_torrent_list()
+        semaphore = asyncio.Semaphore(3)
+
+        async def delete_torrent(torrent_id):
+            async with semaphore:
+                await rd_client.delete_torrent(torrent_id)
+
+        await asyncio.gather(
+            *[delete_torrent(torrent["id"]) for torrent in torrents],
+            return_exceptions=True,
+        )
+
+
+async def validate_realdebrid_credentials(api_key: str, user_ip: str) -> dict:
+    """Validates the RealDebrid credentials."""
+    try:
+        async with RealDebridProvider(
+            api_key=api_key, source_ip=user_ip
+        ) as rd_client:
+            await rd_client.get_user_info()
+            return {"status": "success"}
+    except ProviderException as error:
+        return {
+            "status": "error",
+            "message": f"Failed to verify RealDebrid credential, error: {error.message}",
+        }
