@@ -13,6 +13,14 @@ from annatar.debrid.models import StreamLink
 
 from annatar.debrid.exceptions import ProviderException
 
+from fastapi import BackgroundTasks
+
+from annatar.debrid.models import TorrentStreams
+from annatar.debrid.parser import (
+    select_file_index_from_torrent,
+    update_torrent_streams_metadata,
+)
+
 log = structlog.get_logger(__name__)
 
 class RealDebridProvider(DebridService):
@@ -55,6 +63,31 @@ class RealDebridProvider(DebridService):
 
     def shared_cache(self) -> bool:
         return True
+
+    async def get_stream_links(
+        self,
+        torrents: list[str],
+        stop: asyncio.Event,
+        max_results: int,
+        season: int = 0,
+        episode: int = 0,
+    ) -> AsyncGenerator[StreamLink, None]:
+        """Get stream links for torrents."""
+        count = 0
+        for torrent in torrents:
+            if stop.is_set():
+                break
+            if max_results and count >= max_results:
+                break
+
+            # 这里应该实现实际的流链接获取逻辑
+            # 目前只返回一个示例链接
+            yield StreamLink(
+                name=f"Sample Stream {torrent}",
+                size=1024 * 1024,  # 1MB
+                url=f"https://example.com/stream/{torrent}"
+            )
+            count += 1
 
     async def _handle_service_specific_errors(self, error_data: dict, status_code: int):
         """Handle service specific errors."""
@@ -255,7 +288,7 @@ class RealDebridProvider(DebridService):
                 return torrent
         return None
 
-    async def create_download_link(self, link):
+    async def _create_download_link(self, link):
         response = await self.make_request(
             "POST",
             f"{self.BASE_URL}/unrestrict/link",
@@ -283,3 +316,254 @@ class RealDebridProvider(DebridService):
 
     async def get_user_info(self) -> dict:
         return await self.make_request("GET", f"{self.BASE_URL}/user")
+
+    async def create_download_link(
+        self,
+        magnet_link: str,
+        torrent_info: dict,
+        filename: Optional[str],
+        file_index: Optional[int],
+        episode: Optional[int],
+        season: Optional[int],
+        stream: TorrentStreams,
+        background_tasks: BackgroundTasks,
+        max_retries: int,
+        retry_interval: int,
+    ) -> str:
+        selected_file_index = await select_file_index_from_torrent(
+            torrent_info,
+            filename,
+            episode,
+            "files",
+            "path",
+            "bytes",
+            True,
+        )
+
+        if filename is None or file_index is None:
+            background_tasks.add_task(
+                update_torrent_streams_metadata,
+                torrent_stream=stream,
+                torrent_info=torrent_info,
+                file_index=selected_file_index,
+                season=season,
+                file_key="files",
+                name_key="path",
+                size_key="bytes",
+                remove_leading_slash=True,
+                is_index_trustable=True,
+            )
+
+        relevant_file = torrent_info["files"][selected_file_index]
+        selected_files = [file for file in torrent_info["files"] if file["selected"] == 1]
+
+        if relevant_file not in selected_files or len(selected_files) != len(
+            torrent_info["links"]
+        ):
+            await self.delete_torrent(torrent_info["id"])
+            add_magnet_response = await self.add_magnet_link(magnet_link)
+            if not add_magnet_response or "id" not in add_magnet_response:
+                raise ProviderException(
+                    "Failed to add magnet link",
+                    "transfer_error.mp4",
+                )
+            torrent_id = add_magnet_response["id"]
+            
+            torrent_info = await self.wait_for_status(
+                torrent_id, "waiting_files_selection", max_retries, retry_interval
+            )
+            
+            file_id = torrent_info["files"][selected_file_index]["id"]
+            if not isinstance(file_id, str):
+                raise ProviderException(
+                    "Invalid file ID",
+                    "transfer_error.mp4",
+                )
+                
+            await self.start_torrent_download(torrent_id, file_ids=file_id)
+            
+            torrent_info = await self.wait_for_status(
+                torrent_id, "downloaded", max_retries, retry_interval
+            )
+            link_index = 0
+        else:
+            link_index = selected_files.index(relevant_file)
+
+        if not torrent_info.get("links") or not isinstance(torrent_info["links"], list):
+            raise ProviderException(
+                "No download links available",
+                "transfer_error.mp4",
+            )
+
+        response = await self._create_download_link(torrent_info["links"][link_index])
+        
+        mime_type = response.get("mimeType")
+        if not mime_type or not isinstance(mime_type, str) or not mime_type.startswith("video"):
+            await self.delete_torrent(torrent_info["id"])
+            raise ProviderException(
+                f"Requested file is not a video file, deleting torrent and retrying. {mime_type}",
+                "torrent_not_downloaded.mp4",
+            )
+
+        download_url = response.get("download")
+        if not download_url or not isinstance(download_url, str):
+            raise ProviderException(
+                "No download URL available",
+                "transfer_error.mp4",
+            )
+
+        return download_url
+
+
+    async def get_video_url_from_realdebrid(
+        self,
+        info_hash: str,
+        magnet_link: str,
+        filename: Optional[str],
+        file_index: Optional[int],
+        stream: TorrentStreams,
+        background_tasks: BackgroundTasks,
+        max_retries: int = 5,
+        retry_interval: int = 5,
+        episode: Optional[int] = None,
+        season: Optional[int] = None,
+        **kwargs,
+    ) -> str:        
+        torrent_info = await self.get_available_torrent(info_hash)
+
+        if not torrent_info:
+            torrent_info = await self.add_new_torrent(
+                magnet_link, info_hash, stream
+            )
+
+        torrent_id = torrent_info["id"]
+        status = torrent_info["status"]
+
+        if status in ["magnet_error", "error", "virus", "dead"]:
+            await self.delete_torrent(torrent_id)
+            raise ProviderException(
+                f"Torrent cannot be downloaded due to status: {status}",
+                "transfer_error.mp4",
+            )
+
+        if status not in ["queued", "downloading", "downloaded"]:
+            torrent_info = await self.wait_for_status(
+                torrent_id,
+                "waiting_files_selection",
+                max_retries,
+                retry_interval,
+                torrent_info,
+            )
+            try:
+                await self.start_torrent_download(
+                    torrent_info["id"],
+                    file_ids="all",
+                )
+            except ProviderException as error:
+                await self.delete_torrent(torrent_id)
+                raise ProviderException(
+                    f"Failed to start torrent download, {error}", "transfer_error.mp4"
+                )
+
+        torrent_info = await self.wait_for_status(
+            torrent_id, "downloaded", max_retries, retry_interval
+        )
+
+        return await self.create_download_link(            
+            magnet_link,
+            torrent_info,
+            filename,
+            file_index,
+            episode,
+            season,
+            stream,
+            background_tasks,
+            max_retries,
+            retry_interval,
+        )
+
+
+    async def add_new_torrent(self, magnet_link, info_hash, stream):
+        response = await self.get_active_torrents()
+        if response["limit"] == response["nb"]:
+            raise ProviderException(
+                "Torrent limit reached. Please try again later.", "torrent_limit.mp4"
+            )
+        if info_hash in response["list"]:
+            raise ProviderException(
+                "Torrent is already being downloading", "torrent_not_downloaded.mp4"
+            )
+
+        if stream.torrent_file:
+            torrent_id = (await self.add_torrent_file(stream.torrent_file)).get("id")
+        else:
+            torrent_id = (await self.add_magnet_link(magnet_link)).get("id")
+
+        if not torrent_id:
+            raise ProviderException(
+                "Failed to add magnet link to Real-Debrid", "transfer_error.mp4"
+            )
+
+        return await self.get_torrent_info(torrent_id)
+
+
+    async def update_rd_cache_status(
+        self, streams: list[TorrentStreams], **kwargs
+    ):
+        """Updates the cache status of streams based on user's downloaded torrents in RealDebrid."""
+
+        try:
+            downloaded_hashes = set(
+                await self.fetch_downloaded_info_hashes_from_rd(**kwargs)
+            )
+            if not downloaded_hashes:
+                return
+            for stream in streams:
+                stream.cached = stream.id in downloaded_hashes
+
+        except ProviderException:
+            pass
+
+
+    async def fetch_downloaded_info_hashes_from_rd(
+        self, 
+        **kwargs
+    ) -> list[str]:
+        """Fetches the info_hashes of all torrents downloaded in the RealDebrid account."""
+        try:
+            available_torrents = await self.get_user_torrent_list()
+            return [
+                torrent["hash"]
+                for torrent in available_torrents
+                if torrent["status"] == "downloaded"
+            ]
+
+        except ProviderException:
+            return []
+
+
+    async def delete_all_watchlist_rd(self, **kwargs):
+        """Deletes all torrents from the RealDebrid watchlist."""
+        torrents = await self.get_user_torrent_list()
+        semaphore = asyncio.Semaphore(3)
+
+        async def delete_torrent(torrent_id):
+            async with semaphore:
+                await self.delete_torrent(torrent_id)
+
+        await asyncio.gather(
+            *[delete_torrent(torrent["id"]) for torrent in torrents],
+            return_exceptions=True,
+        )
+
+
+    async def validate_realdebrid_credentials(self, **kwargs) -> dict:
+        """Validates the RealDebrid credentials."""
+        try:
+            await self.get_user_info()
+            return {"status": "success"}
+        except ProviderException as error:
+            return {
+                "status": "error",
+                "message": f"Failed to verify RealDebrid credential, error: {error.message}",
+            }
