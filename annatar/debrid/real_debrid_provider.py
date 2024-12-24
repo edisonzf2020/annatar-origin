@@ -1,9 +1,11 @@
 import asyncio
 from typing import AsyncGenerator, Optional
 import structlog
+from datetime import datetime
 
 import aiohttp
 
+from annatar import instrumentation
 from annatar.debrid.debrid_service import DebridService
 from annatar.debrid.models import StreamLink
 from annatar.debrid.rd_models import (
@@ -54,35 +56,47 @@ class RealDebridProvider(DebridService):
             data=data,
             params=params
         )
+        start_time = datetime.now()
+        status_code: str = "2xx"
+        error = False
 
-        async with aiohttp.ClientSession() as session:
-            async with session.request(
-                method,
-                f"{self.BASE_URL}{url}",
-                headers=self.headers,
-                data=data,
-                params=params,
-            ) as response:
-                if response.status in [401, 403]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                    method,
+                    f"{self.BASE_URL}{url}",
+                    headers=self.headers,
+                    data=data,
+                    params=params,
+                ) as response:
+                    status_code = f"{response.status//100}xx"
+                    if response.status in [401, 403]:
+                        log.error(
+                            "RD authentication failed",
+                            status=response.status,
+                            reason=response.reason,
+                            url=url,
+                        )
+                        return None
+                if response.status not in range(200, 300):
+                    error = True
                     log.error(
-                        "RD authentication failed",
+                        "Error making request",
                         status=response.status,
                         reason=response.reason,
                         url=url,
+                        body=await response.text(),
                     )
                     return None
-                try:
-                    response.raise_for_status()
-                    return await response.json()
-                except Exception as e:
-                    log.error(
-                        "RD request failed",
-                        exc_info=e,
-                        status=response.status,
-                        url=url,
-                        data=data,
-                    )
-                    return None
+                return await response.json()
+        finally:
+            instrumentation.HTTP_CLIENT_REQUEST_DURATION.labels(
+                client="real_debrid",
+                method=method,
+                url=url,
+                error=error,
+                status_code=status_code,
+            ).observe((datetime.now() - start_time).total_seconds())
 
     async def get_stream_links(
         self,

@@ -17,7 +17,7 @@ class TorrentInfo(BaseModel):
     bytes: int
     host: str
     split: int
-    progress: int
+    progress: float  # Changed from int to float to match API response
     status: str
     added: str
     files: List[TorrentFile]
