@@ -12,9 +12,6 @@ from annatar.debrid.real_debrid_provider import RealDebridProvider
 
 _providers: list[DebridService] = [
     RealDebridProvider(api_key="", source_ip=""),
-    PremiumizeProvider(api_key="", source_ip=""),
-    DebridLink(api_key="", source_ip=""),
-    AllDebridProvider(api_key="", source_ip=""),
 ]
 
 

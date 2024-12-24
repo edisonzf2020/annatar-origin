@@ -53,8 +53,7 @@ class NudityStatus(StrEnum):
 class TorrentStreams(Document):
     model_config = ConfigDict(extra="allow")
 
-    info_hash: str = Field(alias="id")  
-    _id: PydanticObjectId = Field(default_factory=PydanticObjectId, alias="_id")  
+    id: str
     meta_id: str
     torrent_name: str
     size: int
@@ -80,12 +79,12 @@ class TorrentStreams(Document):
     def __eq__(self, other):
         if not isinstance(other, TorrentStreams):
             return False
-        return self.info_hash == other.info_hash
+        return self.id == other.id
 
     def __hash__(self):
-        return hash(self.info_hash)
+        return hash(self.id)
 
-    @field_validator("info_hash", mode="after")
+    @field_validator("id", mode="after")
     def validate_id(cls, v):
         return v.lower()
 
