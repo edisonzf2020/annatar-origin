@@ -10,6 +10,7 @@ from aiohttp import FormData
 from annatar import magnet
 from annatar.debrid.debrid_service import DebridService
 from annatar.debrid.models import StreamLink
+from annatar.debrid.rd_models import InstantFile, TorrentInfo, UnrestrictedLink
 
 from annatar.debrid.exceptions import ProviderException
 
@@ -93,9 +94,12 @@ class RealDebridProvider(DebridService):
             )
 
             # 通过get_user_info 得到用户信息，log用户信息
-            user_info = await self.get_user_info()
-            log.info("got RealDebrid user info", user_info=user_info)
+            # user_info = await self.get_user_info()
+            # log.info("got RealDebrid user info", user_info=user_info)
 
+            # 一次性获取所有缓存的种子信息
+            # cached_torrents = await self.get_cached_torrents(torrents)
+            
             # 通过 get_stream_for_torrent 循环获得流媒体链接
             for torrent in torrents:
                 if stop.is_set():
@@ -105,6 +109,7 @@ class RealDebridProvider(DebridService):
                 # log.info("processing torrent", info_hash=info_hash)
                 
                 stream_link = await self.get_stream_for_torrent(torrent, 0)
+                log.info("got RealDebrid stream link", stream_link=stream_link)
                 if stream_link:
                     yield stream_link
         finally:
@@ -112,6 +117,32 @@ class RealDebridProvider(DebridService):
             if self._session:
                 await self._session.close()
                 self._session = None
+
+    async def get_cached_torrents(self, torrents: list[str]) -> dict[str, dict[str, Any]]:
+        """获取多个种子的缓存状态
+        
+        Args:
+            torrents: 种子hash列表
+            
+        Returns:
+            dict: key为种子hash，value为种子信息的字典
+        """
+        # 获取所有已缓存的种子
+        available_torrents = await self.get_user_torrent_list()
+        
+        # 创建缓存字典，key为小写的hash
+        cache_dict = {torrent["hash"].lower(): torrent for torrent in available_torrents}
+        
+        # 检查每个请求的种子是否在缓存中
+        result = {}
+        for torrent in torrents:
+            # 如果是磁力链接，提取info_hash
+            info_hash = torrent.split("btih:")[-1].split("&")[0].lower() if "magnet:" in torrent else torrent.lower()
+            if info_hash in cache_dict:
+                result[info_hash] = cache_dict[info_hash]
+        
+        log.info("checked cached torrents", total=len(torrents), cached=len(result))
+        return result
 
     async def get_stream_for_torrent(
         self,
@@ -126,32 +157,24 @@ class RealDebridProvider(DebridService):
         """
         try:
             # Get torrent info
-            torrent_info = await self.get_available_torrent(info_hash)
+            torrent_info: TorrentInfo | None = await self.get_available_torrent(info_hash)
             log.info("checked a torrent info response from RealDebrid", info_hash=info_hash, torrent_info=torrent_info)
             if not torrent_info:
                 return None
 
-            # Find the specific file
-            target_file = None
-            for file in torrent_info["files"]:
-                if file["id"] == str(file_id):
-                    target_file = file
-                    break
-
-            if not target_file:
+            # 如果种子已下载完成且有链接，直接返回
+            if not torrent_info:
+                log.info("failed to get RealDebrid torrent info", info_hash=info_hash)
                 return None
+            if torrent_info.get("links"):
+                url: str = f"/rd/{self.api_key}/{info_hash}/{torrent_info.get('id')}/{torrent_info.get('filename')}"
+                return StreamLink(
+                    name=torrent_info.get("filename"),
+                    size=torrent_info.get("bytes"),
+                    url=url
+                )
 
-            # Get download link
-            response = await self._create_download_link(target_file["download"])
-            if not response or not response.get("download"):
-                return None
-
-            log.info("created a cached torrent download link", response=response)
-            return StreamLink(
-                name=target_file["path"].split("/")[-1],
-                size=target_file["bytes"],
-                url=response["download"]
-            )
+            return None
 
         except (KeyError, IndexError, ProviderException):
             return None
@@ -349,11 +372,11 @@ class RealDebridProvider(DebridService):
         )
 
     async def get_available_torrent(self, info_hash) -> Optional[dict[str, Any]]:
+        """获取单个种子的缓存状态（已弃用，请使用get_cached_torrents）"""
         available_torrents = await self.get_user_torrent_list()
         info_hash = info_hash.lower()  # 将输入的info_hash转换为小写
         for torrent in available_torrents:
             torrent_hash = torrent["hash"].lower()  # 将RealDebrid返回的hash转换为小写
-            # log.info("checking torrent from RealDebrid", torrent_info_hash=torrent_hash, info_hash=info_hash)
             if torrent_hash == info_hash:
                 return torrent
         return None
