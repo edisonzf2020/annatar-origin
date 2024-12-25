@@ -7,6 +7,12 @@ from annatar.debrid.models import StreamLink
 
 
 class RealDebridProvider(DebridService):
+    # def __init__(self, api_key: str, source_ip: Optional[str] = None):
+    #     """Initialize the provider with API key and optional source IP."""
+    #     super().__init__(api_key=api_key, source_ip=source_ip)  # 调用父类的初始化方法
+    #     self.api_key = api_key
+    #     self.source_ip = source_ip
+
     def __str__(self) -> str:
         return "RealDebridProvider"
 

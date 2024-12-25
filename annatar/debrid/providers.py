@@ -1,9 +1,5 @@
 from typing import Optional
 
-import structlog
-
-log = structlog.get_logger(__name__)
-
 from annatar.debrid.alldebrid import AllDebridProvider
 from annatar.debrid.debrid_service import DebridService
 from annatar.debrid.debridlink import DebridLink
@@ -12,6 +8,9 @@ from annatar.debrid.real_debrid_provider import RealDebridProvider
 
 _providers: list[DebridService] = [
     RealDebridProvider(api_key="", source_ip=""),
+    PremiumizeProvider(api_key="", source_ip=""),
+    DebridLink(api_key="", source_ip=""),
+    AllDebridProvider(api_key="", source_ip=""),
 ]
 
 
@@ -28,7 +27,6 @@ def list_providers() -> list[dict[str, str]]:
 
 
 def get_provider(provider_name: str, api_key: str, source_ip: str) -> Optional[DebridService]:
-    log.info("getting provider", provider_name=provider_name, api_key=api_key, source_ip=source_ip)
     for p in _providers:
         if p.id() == provider_name:
             return p.__class__(api_key=api_key, source_ip=source_ip)
